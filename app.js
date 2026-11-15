@@ -1,6 +1,7 @@
 'use strict';
 
 const KEY = 'tg-planner-v1';
+const MODEL = 'claude-opus-5-5';
 const COURSES = ['Starters', 'Main', 'Sides', 'Desserts', 'Drinks'];
 const $ = (s, r = document) => r.querySelector(s);
 const uid = () => Math.random().toString(36).slice(2, 9);
@@ -143,12 +144,17 @@ function applyStarter(s) {
 
 // ---------- State ----------
 
-const defaults = () => ({ tday: nextThanksgiving(), guests: 8, model: 'gpt-5-mini', apiKey: '', view: 'dish', chat: [], menu: [], tasks: [] });
+const defaults = () => ({ tday: nextThanksgiving(), guests: 8, model: MODEL, apiKey: '', view: 'dish', chat: [], menu: [], tasks: [] });
 
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && Array.isArray(s.menu) && Array.isArray(s.tasks)) return { ...defaults(), ...s };
+    if (s && Array.isArray(s.menu) && Array.isArray(s.tasks)) {
+      // Earlier versions talked to OpenAI: drop a saved OpenAI model name and key.
+      if (!String(s.model).startsWith('claude')) s.model = MODEL;
+      if (s.apiKey && !s.apiKey.startsWith('sk-ant-')) s.apiKey = '';
+      return { ...defaults(), ...s };
+    }
   } catch { /* fall through to defaults */ }
   return defaults();
 }
@@ -250,7 +256,7 @@ function renderTimeline() {
     <button class="btn" data-act="add-task">+ Task</button></div>`;
   if (!state.tasks.length) {
     html += `<p class="empty">No cooking schedule yet.<br>${state.menu.length
-      ? `<button class="btn primary" data-ask="Build a day-by-day cooking timeline for my current menu, with dinner at 4 PM.">Ask ChatGPT to build one</button>`
+      ? `<button class="btn primary" data-ask="Build a day-by-day cooking timeline for my current menu, with dinner at 4 PM.">Ask Claude to build one</button>`
       : 'Pick a starter menu on the Menu tab and it will fill in here.'}</p>`;
   }
   for (const day of days) {
@@ -324,10 +330,10 @@ function taskDialog(task, day) {
 function settingsDialog() {
   openDialog(`
     <h3>Settings</h3>
-    <label>OpenAI API key<input name="apiKey" type="password" value="${esc(state.apiKey)}" placeholder="sk-…" autocomplete="off"></label>
-    <p class="hint">Needed for ChatGPT and voice. Stored only on this device and sent only to OpenAI. Create one at platform.openai.com → API keys.</p>
+    <label>Claude API key<input name="apiKey" type="password" value="${esc(state.apiKey)}" placeholder="sk-ant-…" autocomplete="off"></label>
+    <p class="hint">Needed for the Ask Claude tab. Stored only on this device and sent only to Anthropic. Create one at platform.claude.com → API keys.</p>
     <div class="two">
-      <label>ChatGPT model<input name="model" value="${esc(state.model)}" autocomplete="off" autocapitalize="off"></label>
+      <label>Claude model<input name="model" value="${esc(state.model)}" autocomplete="off" autocapitalize="off"></label>
       <label>Guests<input name="guests" type="number" min="1" max="99" value="${state.guests}"></label>
     </div>
     <label>Thanksgiving date<input name="tday" type="date" required value="${state.tday}"></label>
@@ -343,13 +349,13 @@ function settingsDialog() {
       return;
     }
     state.apiKey = fd.get('apiKey').trim();
-    state.model = fd.get('model').trim() || 'gpt-5-mini';
+    state.model = fd.get('model').trim() || MODEL;
     state.guests = Math.max(1, Number(fd.get('guests')) || 8);
     state.tday = fd.get('tday') || state.tday;
   });
 }
 
-// ---------- Mutations (shared by the forms and by ChatGPT) ----------
+// ---------- Mutations (shared by the forms and by Claude) ----------
 
 const same = (a, b) => String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
 const findDish = name => state.menu.find(d => same(d.name, name));
@@ -400,40 +406,42 @@ function removeTask({ id }) {
   return `Removed task: ${task.text}`;
 }
 
-// ---------- ChatGPT ----------
+// ---------- Claude ----------
+// Called straight from the browser with the user's own key (there is no server), so this uses
+// plain fetch against the Messages API rather than the SDK, which would need a build step.
 
-const fn = (name, description, properties, required) =>
-  ({ type: 'function', function: { name, description, parameters: { type: 'object', properties, required } } });
+const tool = (name, description, properties, required) =>
+  ({ name, description, input_schema: { type: 'object', properties, required } });
 const TOOLS = [
-  fn('set_dish', 'Add a new dish, or replace an existing one (matched by name, case-insensitive). Always pass the complete ingredient list for the dish.', {
+  tool('set_dish', 'Add a new dish, or replace an existing one (matched by name, case-insensitive). Always pass the complete ingredient list for the dish.', {
     name: { type: 'string' },
     previous_name: { type: 'string', description: 'Only when renaming: the dish\'s current name' },
     course: { type: 'string', description: 'Starters, Main, Sides, Desserts or Drinks' },
     ingredients: { type: 'array', items: { type: 'string' }, description: 'One shopping-list item per entry, quantity first, e.g. "2 cups heavy cream"' },
   }, ['name', 'course', 'ingredients']),
-  fn('remove_dish', 'Remove a dish and its ingredients from the menu.', { name: { type: 'string' } }, ['name']),
-  fn('set_task', 'Add a cooking timeline task, or update an existing one by id (only the fields passed are changed).', {
+  tool('remove_dish', 'Remove a dish and its ingredients from the menu.', { name: { type: 'string' } }, ['name']),
+  tool('set_task', 'Add a cooking timeline task, or update an existing one by id (only the fields passed are changed).', {
     id: { type: 'string', description: 'Existing task id; omit to add a new task' },
     text: { type: 'string' },
     day: { type: 'string', description: 'YYYY-MM-DD' },
     time: { type: 'string', description: '24-hour HH:MM, or "" for no specific time' },
     done: { type: 'boolean' },
   }, []),
-  fn('remove_task', 'Remove a timeline task by id.', { id: { type: 'string' } }, ['id']),
+  tool('remove_task', 'Remove a timeline task by id.', { id: { type: 'string' } }, ['id']),
 ];
 const TOOL_IMPL = { set_dish: setDish, remove_dish: removeDish, set_task: setTask, remove_task: removeTask };
 
 function systemPrompt() {
   const menu = state.menu.map(d => ({ name: d.name, course: d.course, ingredients: d.ingredients.map(i => i.text + (i.got ? ' (owned)' : '')) }));
   const tasks = state.tasks.map(({ id, day, time, text, done }) => ({ id, day, time, text, done }));
-  return `You are a friendly Thanksgiving cooking assistant built into a meal-planning app on the user's phone.
+  return `You are the cooking assistant inside a Thanksgiving meal-planning app on the user's phone.
 Today is ${today()}. Thanksgiving dinner is on ${state.tday}, for ${state.guests} guests.
 
-Answer cooking questions (unit conversions, substitutions, timing, food safety) briefly and directly; the user is often reading mid-task in a kitchen or a store. Use plain text only, no markdown.
+The user is usually mid-task in a kitchen or a grocery store, so answer cooking questions (unit conversions, substitutions, timing, food safety) in a sentence or two, leading with the answer. The app shows your reply as plain text, so write without markdown.
 
-The user often speaks instead of typing, so messages may be transcribed speech with misheard words or run-together lists; read them charitably. When the user names foods they want to serve, add each one as its own dish with set_dish. Base each ingredient list on the most popular, widely made version of that recipe (the kind a top-rated recipe site would give), with quantities scaled for the guest count, written the way they would appear on a shopping list. Give each dish a clear menu-style name and the right course.
+The user often dictates instead of typing, so a message may be transcribed speech with misheard words or a run-together list; read it charitably. When the user names foods they want to serve, add each one as its own dish with set_dish. Base each ingredient list on the most popular, widely made version of that recipe, with quantities scaled for the guest count and written the way they would appear on a shopping list. Give each dish a clear menu-style name and the right course.
 
-When the user asks to change the menu, the ingredients or the cooking timeline, make the change with the tools, then confirm what changed in a sentence or two. When a menu change affects the cooking schedule and a timeline already exists, update the timeline tasks too. Do not change anything the user did not ask about.
+When the user asks to change the menu, the ingredients or the cooking timeline, make the change with the tools, then confirm what changed in a sentence or two. When a menu change affects the cooking schedule and a timeline already exists, update the affected timeline tasks as well. Leave everything the user did not ask about as it is.
 
 Current menu (ingredients marked "owned" are already in the user's kitchen):
 ${JSON.stringify(menu)}
@@ -442,8 +450,8 @@ Current cooking timeline:
 ${JSON.stringify(tasks)}`;
 }
 
-let busy = '';   // status text while waiting on OpenAI
-let rec = null;  // active MediaRecorder while listening
+let busy = '';   // status text while waiting on Claude
+let rec = null;  // active speech recognition while listening
 
 function renderChat() {
   const log = $('#chatLog');
@@ -467,7 +475,35 @@ function renderChat() {
 }
 
 const chatError = text => { state.chat.push({ role: 'error', content: text }); save(); renderChat(); };
-const NEED_KEY = 'Add your OpenAI API key in Settings (the gear, top right) to use ChatGPT and voice.';
+const NEED_KEY = 'Add your Claude API key in Settings (the gear, top right) to use the assistant.';
+
+async function callClaude(messages) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': state.apiKey,
+      'anthropic-version': '2026-10-21',
+      'anthropic-beta': 'server-side-fallback-2026-07-01',
+      'anthropic-dangerous-direct-browser-access': 'true', // required for calls made from a web page
+    },
+    body: JSON.stringify({
+      model: state.model,
+      max_tokens: 16000,
+      output_config: { effort: 'low' }, // short kitchen questions; keeps replies quick
+      fallbacks: 'default',             // if the model declines a request, let the API route it to another
+      system: systemPrompt(),
+      tools: TOOLS,
+      messages,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) return data;
+  if (res.status === 401) throw new Error('that API key was not accepted. Check it in Settings.');
+  if (res.status === 429) throw new Error('rate limit reached. Wait a moment and try again.');
+  if (res.status >= 500) throw new Error('Claude is temporarily unavailable. Try again shortly.');
+  throw new Error(data.error?.message || `HTTP ${res.status}`);
+}
 
 async function sendChat(text) {
   text = text.trim();
@@ -476,39 +512,42 @@ async function sendChat(text) {
   state.chat.push({ role: 'user', content: text });
   if (!state.apiKey) return chatError(NEED_KEY);
   busy = 'Thinking…'; renderChat();
-  const messages = [{ role: 'system', content: systemPrompt() },
-    ...state.chat.filter(m => m.role === 'user' || m.role === 'assistant').slice(-12).map(({ role, content }) => ({ role, content }))];
+
+  const history = state.chat.filter(m => m.role === 'user' || m.role === 'assistant').slice(-12);
+  while (history[0]?.role !== 'user') history.shift(); // the conversation must open with the user
+  const messages = history.map(({ role, content }) => ({ role, content }));
   const changes = [];
+  const noteChanges = () => { if (changes.length) state.chat.push({ role: 'note', content: changes.map(c => `✓ ${c}`).join('\n') }); };
   try {
-    for (let round = 0; ; round++) {
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.apiKey}` },
-        body: JSON.stringify({ model: state.model, messages, tools: TOOLS }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error?.message || `OpenAI returned HTTP ${res.status}`);
-      const msg = data.choices[0].message;
-      messages.push(msg);
-      if (msg.tool_calls?.length && round < 6) {
-        for (const call of msg.tool_calls) {
-          let out;
+    for (let round = 0; round < 8; round++) {
+      const msg = await callClaude(messages);
+      messages.push({ role: 'assistant', content: msg.content }); // sent back unchanged, thinking blocks included
+      const reply = msg.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+
+      if (msg.stop_reason === 'tool_use') {
+        const results = msg.content.filter(b => b.type === 'tool_use').map(call => {
           try {
-            out = TOOL_IMPL[call.function.name](JSON.parse(call.function.arguments || '{}'));
+            const out = TOOL_IMPL[call.name](call.input ?? {});
             changes.push(out);
-          } catch (e) { out = `Error: ${e.message}`; }
-          messages.push({ role: 'tool', tool_call_id: call.id, content: out });
-        }
+            return { type: 'tool_result', tool_use_id: call.id, content: out };
+          } catch (e) {
+            return { type: 'tool_result', tool_use_id: call.id, content: `Error: ${e.message}`, is_error: true };
+          }
+        });
+        messages.push({ role: 'user', content: results }); // every result in one message
         save(); renderMenu(); renderTimeline();
         continue;
       }
-      if (changes.length) state.chat.push({ role: 'note', content: changes.map(c => `✓ ${c}`).join('\n') });
-      state.chat.push({ role: 'assistant', content: msg.content || 'Done.' });
+      noteChanges();
+      if (msg.stop_reason === 'refusal') state.chat.push({ role: 'error', content: 'Claude declined to answer that one. Try rephrasing it.' });
+      else state.chat.push({ role: 'assistant', content: reply || 'Done.' });
+      changes.length = 0;
       break;
     }
+    noteChanges(); // only non-empty if the loop ran out of rounds mid-change
   } catch (e) {
-    if (changes.length) state.chat.push({ role: 'note', content: changes.map(c => `✓ ${c}`).join('\n') });
-    state.chat.push({ role: 'error', content: `Couldn't reach ChatGPT: ${e.message}` });
+    noteChanges();
+    state.chat.push({ role: 'error', content: `Couldn't reach Claude: ${e.message}` });
   }
   busy = '';
   state.chat = state.chat.slice(-60);
@@ -516,52 +555,45 @@ async function sendChat(text) {
 }
 
 // ---------- Voice ----------
-// Records with the microphone and transcribes through OpenAI, because the browser's built-in
-// speech recognition is not available to home-screen apps on iPhone.
+// Uses the phone's own speech recognition, so nothing is recorded or sent anywhere by this app.
+// Where the browser doesn't offer it, the keyboard's dictation key does the same job.
 
-async function transcribe(blob) {
-  const ext = blob.type.includes('webm') ? 'webm' : blob.type.includes('ogg') ? 'ogg' : 'mp4';
-  let err;
-  for (const model of ['gpt-4o-mini-transcribe', 'whisper-1']) {
-    const fd = new FormData();
-    fd.append('file', blob, `speech.${ext}`);
-    fd.append('model', model);
-    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST', headers: { Authorization: `Bearer ${state.apiKey}` }, body: fd,
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) return String(data.text ?? '').trim();
-    err = new Error(data.error?.message || `OpenAI returned HTTP ${res.status}`);
-    if (res.status === 401 || res.status === 429) break; // a different model won't help
-  }
-  throw err;
-}
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-async function toggleMic() {
+function toggleMic() {
   if (rec) { rec.stop(); return; }
   if (busy) return;
   showTab('chat');
   if (!state.apiKey) return chatError(NEED_KEY);
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return chatError('This browser can\'t record audio. You can still type, or use the microphone key on the keyboard.');
-  let stream;
-  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-  catch { return chatError('Microphone access was blocked. Allow it for this site in Settings, or type instead.'); }
-
-  const chunks = [];
-  const recorder = rec = new MediaRecorder(stream);
-  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-  recorder.onstop = async () => {
-    stream.getTracks().forEach(t => t.stop());
-    rec = null;
-    busy = 'Writing down what you said…'; renderChat();
-    let text = '', failed = '';
-    try { text = await transcribe(new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' })); }
-    catch (e) { failed = `Couldn't transcribe that: ${e.message}`; }
-    busy = '';
-    if (text) sendChat(text);
-    else chatError(failed || 'I didn\'t catch anything. Tap the mic and try again.');
+  if (!SR) {
+    input.focus();
+    return chatError('Voice input isn\'t available in this browser. Tap the microphone key on your keyboard to dictate instead.');
+  }
+  const r = rec = new SR();
+  r.lang = navigator.language || 'en-US';
+  r.continuous = true;
+  r.interimResults = true;
+  let heard = '', problem = '';
+  r.onresult = e => {
+    let interim = '';
+    for (let n = e.resultIndex; n < e.results.length; n++) {
+      const t = e.results[n][0].transcript;
+      if (e.results[n].isFinal) heard += `${t.trim()} `; else interim += t;
+    }
+    input.value = heard + interim; // show the words as they are recognised
+    input.dispatchEvent(new Event('input'));
   };
-  recorder.start();
+  r.onerror = e => { problem = e.error; };
+  r.onend = () => {
+    rec = null;
+    const text = input.value.trim();
+    input.value = ''; input.style.height = '';
+    if (text) sendChat(text);
+    else if (problem === 'not-allowed' || problem === 'service-not-allowed') {
+      chatError('Microphone or speech recognition is blocked for this app. Allow it in Settings, or use the microphone key on your keyboard.');
+    } else chatError('I didn\'t catch anything. Tap the mic and try again, or use the microphone key on your keyboard.');
+  };
+  try { r.start(); } catch { rec = null; return chatError('Couldn\'t start listening. Use the microphone key on your keyboard instead.'); }
   renderChat();
 }
 
