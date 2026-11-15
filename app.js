@@ -165,10 +165,104 @@ const save = () => localStorage.setItem(KEY, JSON.stringify(state));
 
 const openDishes = new Set(); // which dishes are expanded; not saved
 
-// Strip a leading quantity/unit so the shopping list sorts by the ingredient itself.
-const itemName = t => t.replace(/^[\d\s\/.,½¼¾⅓⅔–-]+/, '')
-  .replace(/^(lbs?|oz|cups?|tbsp|tsp|sticks?|cans?|bags?|boxes|box|bunch(es)?|heads?|cloves?|pints?|quarts?|dozen|stalks?|loaf|loaves|large|medium|small)\b\.?\s*/i, '')
-  .replace(/^\(.*?\)\s*/, '').replace(/^of\s+/i, '').toLowerCase();
+// ----- Shopping list: the same ingredient across dishes becomes one line -----
+
+const UNIT_RE = /^(lbs?|oz|cups?|tbsp|tsp|sticks?|cans?|bags?|boxes|box|bunch(?:es)?|heads?|cloves?|pints?|quarts?|dozen|stalks?|loaf|loaves)\b\.?\s*/i;
+const UNIT_ONE = { lbs: 'lb', cups: 'cup', sticks: 'stick', cans: 'can', bags: 'bag', boxes: 'box', bunches: 'bunch', heads: 'head', cloves: 'clove', pints: 'pint', quarts: 'quart', stalks: 'stalk', loaves: 'loaf' };
+const UNIT_MANY = Object.fromEntries(Object.entries(UNIT_ONE).filter(([many]) => many !== 'lbs').map(([many, one]) => [one, many]));
+const VOLUME = { tsp: 1 / 3, tbsp: 1, stick: 8, cup: 16, pint: 32, quart: 64 }; // in tablespoons
+const FRACTIONS = { '½': ' 1/2', '¼': ' 1/4', '¾': ' 3/4', '⅓': ' 1/3', '⅔': ' 2/3' };
+
+// "2 1/2" -> 2.5; null for ranges ("14–16") or anything else that can't be added up.
+function parseQty(s) {
+  s = s.replace(/[½¼¾⅓⅔]/g, c => FRACTIONS[c]).trim();
+  if (!s || /[–-]/.test(s)) return null;
+  let total = 0;
+  for (const part of s.split(/\s+/)) {
+    const [a, b] = part.split('/').map(Number);
+    const n = b === undefined ? a : a / b;
+    if (!isFinite(n)) return null;
+    total += n;
+  }
+  return total;
+}
+
+function fmtQty(n) {
+  const whole = Math.floor(n + 1e-9), frac = n - whole;
+  if (frac < 0.02) return String(whole);
+  const hit = [[1 / 8, '1/8'], [1 / 6, '1/6'], [1 / 4, '1/4'], [1 / 3, '1/3'], [3 / 8, '3/8'], [1 / 2, '1/2'], [5 / 8, '5/8'], [2 / 3, '2/3'], [3 / 4, '3/4'], [5 / 6, '5/6'], [7 / 8, '7/8']].find(([v]) => Math.abs(v - frac) < 0.02);
+  return hit ? `${whole || ''} ${hit[1]}`.trim() : String(Math.round(n * 100) / 100);
+}
+
+// "2 cans (10.5 oz) cream of mushroom soup" -> qty 2, unit "can", size "(10.5 oz)", name "cream of mushroom soup"
+function parseIng(text) {
+  let rest = text.trim();
+  const q = rest.match(/^[\d\s\/.,½¼¾⅓⅔–-]+/);
+  const qtyText = q ? q[0].trim() : '';
+  if (q) rest = rest.slice(q[0].length);
+  const u = qtyText && rest.match(UNIT_RE);
+  let unit = u ? u[1].toLowerCase() : '';
+  unit = UNIT_ONE[unit] || unit;
+  if (u) rest = rest.slice(u[0].length);
+  const p = qtyText && rest.match(/^\(.*?\)\s*/);
+  const size = p ? p[0].trim() : '';
+  if (p) rest = rest.slice(p[0].length);
+  const name = rest.replace(/^of\s+/i, '').replace(/\s*\([^)]*\)\s*$/, '').trim(); // drop notes like "(for the wash)"
+  // Same ingredient regardless of plural or a leading size word: "2 yellow onions" matches "1 yellow onion".
+  const key = name.toLowerCase().replace(/^(large|medium|small)\s+/, '').replace(/oes$/, 'o').replace(/s$/, '');
+  return { qtyText, qty: parseQty(qtyText), unit, size, name, key };
+}
+
+// entries: [{ i, dish, p }] for one ingredient. Quantities in the same unit are added together;
+// different units stay side by side ("3 sticks + 8 tbsp unsalted butter").
+function combinedLabel(entries) {
+  if (entries.length === 1) return entries[0].i.text;
+  const all = entries;
+  const buckets = new Map(), loose = [];
+  // Mixed kitchen measures of one ingredient ("1/4 cup" + "4 tbsp", "1 stick" + "4 tbsp") convert to a single unit.
+  const measured = entries.map(e => e.p).filter(p => p.qty != null && !p.size && VOLUME[p.unit]);
+  const mixed = new Set(measured.map(p => p.unit));
+  if (mixed.size > 1) {
+    const tbsp = measured.reduce((sum, p) => sum + p.qty * VOLUME[p.unit], 0);
+    const unit = mixed.has('stick') ? 'stick' : tbsp >= 4 ? 'cup' : 'tbsp';
+    buckets.set('measure', { unit, size: '', total: tbsp / VOLUME[unit] });
+    entries = entries.filter(e => !measured.includes(e.p));
+  }
+  for (const { p } of entries) {
+    if (p.qty == null) { if (p.qtyText) loose.push([p.qtyText, p.unit, p.size].filter(Boolean).join(' ')); continue; }
+    const k = `${p.unit}|${p.size}`;
+    const b = buckets.get(k) ?? { unit: p.unit, size: p.size, total: 0 };
+    b.total += p.qty;
+    buckets.set(k, b);
+  }
+  const parts = [...buckets.values()].map(b =>
+    [fmtQty(b.total), b.total > 1 ? UNIT_MANY[b.unit] || b.unit : b.unit, b.size].filter(Boolean).join(' ')).concat(loose);
+  // Prefer a name that is already plural when the total is more than one ("2 eggs", not "2 egg").
+  const biggest = all.reduce((a, b) => ((b.p.qty ?? 0) > (a.p.qty ?? 0) ? b : a)).p;
+  let name = biggest.name;
+  const only = buckets.size === 1 && !loose.length ? [...buckets.values()][0] : null;
+  if (only && !only.unit && only.total > 1 && !(biggest.qty > 1) && !/s$/i.test(name)) name += 's';
+  const label = [parts.join(' + '), name].filter(Boolean).join(' ');
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function shoppingGroups(got) {
+  const groups = new Map();
+  for (const d of state.menu) for (const i of d.ingredients) {
+    if (i.got !== got) continue;
+    const p = parseIng(i.text);
+    if (!groups.has(p.key)) groups.set(p.key, []);
+    groups.get(p.key).push({ i, dish: d.name, p });
+  }
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([, entries]) => ({
+    ids: entries.map(e => e.i.id).join(','),
+    label: combinedLabel(entries),
+    dishes: [...new Set(entries.map(e => e.dish))].join(' · '),
+  }));
+}
+
+const groupRows = (groups, got) => `<ul class="ings">${groups.map(g =>
+  `<li><label><input type="checkbox" data-ings="${g.ids}" ${got ? 'checked' : ''}><span>${esc(g.label)}<span class="tag">${esc(g.dishes)}</span></span></label></li>`).join('')}</ul>`;
 
 const ingRow = (i, tag) => `<li><label><input type="checkbox" data-ing="${i.id}" ${i.got ? 'checked' : ''}><span>${esc(i.text)}${tag ? `<span class="tag">${esc(tag)}</span>` : ''}</span></label></li>`;
 
@@ -213,10 +307,10 @@ function renderMenu() {
     </div>`;
 
   if (state.view === 'all') {
-    const rows = state.menu.flatMap(d => d.ingredients.map(i => ({ i, tag: d.name })))
-      .sort((a, b) => itemName(a.i.text).localeCompare(itemName(b.i.text)));
-    html += `<div class="carte"><header class="carte-head"><h2>Shopping List</h2><p>${all.length - owned} to buy · ${owned} owned</p></header>
-      <div class="dish-body">${ingLists(rows)}</div></div>`;
+    const need = shoppingGroups(false), have = shoppingGroups(true);
+    html += `<div class="carte"><header class="carte-head"><h2>Shopping List</h2><p>${need.length} to buy · ${have.length} owned</p></header>
+      <div class="dish-body">${need.length ? `<p class="lbl">Still to buy</p>${groupRows(need, false)}` : '<p class="lbl done">You have everything ✓</p>'}
+      ${have.length ? `<p class="lbl">Owned</p>${groupRows(have, true)}` : ''}</div></div>`;
   } else {
     html += `<div class="carte"><header class="carte-head"><p class="orn">❦</p><h2>Thanksgiving Dinner</h2><p>${longDate()}</p></header>`;
     const courses = [...new Set([...COURSES, ...state.menu.map(d => d.course)])];
@@ -627,7 +721,11 @@ document.addEventListener('click', e => {
 
 document.addEventListener('change', e => {
   const d = e.target.dataset;
-  if (d.ing) {
+  if (d.ings) { // a combined shopping-list line: tick every dish's copy of the ingredient
+    const ids = new Set(d.ings.split(','));
+    state.menu.flatMap(x => x.ingredients).forEach(i => { if (ids.has(i.id)) i.got = e.target.checked; });
+    save(); renderMenu();
+  } else if (d.ing) {
     const ing = state.menu.flatMap(x => x.ingredients).find(i => i.id === d.ing);
     if (ing) { ing.got = e.target.checked; save(); renderMenu(); }
   } else if (d.taskCheck) {
